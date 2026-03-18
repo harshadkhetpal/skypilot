@@ -24,7 +24,7 @@ from sky import exceptions
 from sky.client import service_account_auth
 from sky.server import common as server_common
 from sky.server import constants
-from sky.server.server import SSHMessageType
+from sky.server.ssh_proxy import SSHMessageType
 from sky.skylet import constants as skylet_constants
 
 BUFFER_SIZE = 2**16  # 64KB
@@ -36,10 +36,16 @@ MAX_UNANSWERED_PINGS = 100
 OPEN_TIMEOUT_SECONDS = 60
 
 
-async def main(url: str, timestamps_supported: bool, login_url: str) -> None:
+async def main(url: str,
+               timestamps_supported: bool,
+               login_url: str,
+               override_headers: Optional[Dict[str, str]] = None) -> None:
     headers = {}
-    headers.update(server_common.get_cookie_header_for_url(url))
-    headers.update(service_account_auth.get_service_account_headers())
+    if override_headers:
+        headers.update(override_headers)
+    else:
+        headers.update(server_common.get_cookie_header_for_url(url))
+        headers.update(service_account_auth.get_service_account_headers())
     try:
         async with connect(url,
                            ping_interval=None,
@@ -254,8 +260,41 @@ if __name__ == '__main__':
     endpoint = sys.argv[3] if len(sys.argv) > 3 else 'kubernetes-pod-ssh-proxy'
     # Worker index for Slurm.
     worker_idx = sys.argv[4] if len(sys.argv) > 4 else '0'
+    cluster_name = sys.argv[2]
     websocket_url = (f'{server_url}/{endpoint}'
-                     f'?cluster_name={sys.argv[2]}'
+                     f'?cluster_name={cluster_name}'
                      f'&worker={worker_idx}'
                      f'{client_version_str}')
-    asyncio.run(main(websocket_url, timestamps_are_supported, _login_url))
+
+    # Pre-flight redirect check: ask server if SSH should go through an agent
+    proxy_info_url = (f'{_login_url}/ssh-proxy-info'
+                      f'?cluster_name={cluster_name}&endpoint={endpoint}')
+    try:
+        cookie_hdr = server_common.get_cookie_header_for_url(proxy_info_url)
+        sa_hdr = service_account_auth.get_service_account_headers()
+        all_headers = {**cookie_hdr, **sa_hdr}
+        proxy_info = requests.get(proxy_info_url,
+                                  headers=all_headers,
+                                  timeout=5).json()
+    except Exception:  # pylint: disable=broad-except
+        proxy_info = {'redirect': False}
+
+    if proxy_info.get('redirect'):
+        # Redirect: connect to agent instead of API server
+        agent_url = proxy_info['agent_url']
+        agent_token = proxy_info['token']
+        agent_proto, agent_fqdn = agent_url.split('://')
+        ws_proto = 'wss' if agent_proto == 'https' else 'ws'
+        websocket_url = (f'{ws_proto}://{agent_fqdn}/{endpoint}'
+                         f'?cluster_name={cluster_name}'
+                         f'&worker={worker_idx}'
+                         f'{client_version_str}')
+        asyncio.run(
+            main(websocket_url,
+                 timestamps_are_supported,
+                 _login_url,
+                 override_headers={'Authorization':
+                                   f'Bearer {agent_token}'}))
+    else:
+        asyncio.run(
+            main(websocket_url, timestamps_are_supported, _login_url))
