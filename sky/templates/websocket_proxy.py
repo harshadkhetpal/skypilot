@@ -36,6 +36,7 @@ MAX_UNANSWERED_PINGS = 100
 OPEN_TIMEOUT_SECONDS = 60
 
 
+
 async def main(url: str,
                timestamps_supported: bool,
                login_url: str,
@@ -283,14 +284,24 @@ if __name__ == '__main__':
         # Redirect: connect to agent instead of API server
         agent_url = proxy_info['agent_url']
         agent_token = proxy_info['token']
+        # Ensure agent_url has a scheme for reliable parsing
+        if '://' not in agent_url:
+            agent_url = f'http://{agent_url}'
+
         agent_proto, agent_fqdn = agent_url.split('://')
         ws_proto = 'wss' if agent_proto == 'https' else 'ws'
-        websocket_url = (f'{ws_proto}://{agent_fqdn}/{endpoint}'
-                         f'?cluster_name={cluster_name}'
-                         f'&worker={worker_idx}'
-                         f'{client_version_str}')
+        # Pass pod_name and namespace so the agent can port-forward
+        # directly without looking up the cluster in its database.
+        pod_name = proxy_info.get('pod_name', '')
+        namespace = proxy_info.get('namespace', '')
+        agent_ws_url = (f'{ws_proto}://{agent_fqdn}/{endpoint}'
+                        f'?cluster_name={cluster_name}'
+                        f'&worker={worker_idx}'
+                        f'&pod_name={pod_name}'
+                        f'&namespace={namespace}'
+                        f'{client_version_str}')
         asyncio.run(
-            main(websocket_url,
+            main(agent_ws_url,
                  timestamps_are_supported,
                  _login_url,
                  override_headers={'Authorization':
