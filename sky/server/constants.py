@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 42  # api_access support for managed jobs
+API_VERSION = 43  # SSH redirect via WebSocket first-frame protocol
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -39,6 +39,11 @@ UPLOAD_API_V2_VERSION = 41
 # Minimum server API version required for api_access in managed jobs.
 MIN_API_ACCESS_API_VERSION = 42
 
+# Minimum API version that supports the SSH redirect first-frame protocol,
+# where the server sends a REDIRECT message type (3) as the first WebSocket
+# frame instead of requiring a separate /ssh-proxy-info pre-flight HTTP GET.
+MIN_SSH_REDIRECT_PROTOCOL_VERSION = 43
+
 # Prefix for API request names.
 REQUEST_NAME_PREFIX = 'sky.'
 # The memory (GB) that SkyPilot tries to not use to prevent OOM.
@@ -65,8 +70,7 @@ API_COOKIE_FILE_ENV_VAR = f'{constants.SKYPILOT_ENV_VAR_PREFIX}API_COOKIE_FILE'
 API_COOKIE_FILE_DEFAULT_LOCATION = '~/.sky/cookies.txt'
 
 # The path to the dashboard build output
-DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), '..', 'dashboard',
-                             'out')
+DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), '..', 'dashboard', 'out')
 
 # The interval (seconds) for the event to be restarted in the background.
 DAEMON_RESTART_INTERVAL_SECONDS = 20

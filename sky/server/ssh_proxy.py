@@ -8,6 +8,7 @@ SkyPilot Agent).
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from enum import IntEnum
+import json
 import os
 import shlex
 import socket
@@ -16,7 +17,6 @@ import typing
 from typing import Awaitable, Callable, Optional, Type
 
 import fastapi
-
 from sky import clouds
 from sky import core
 from sky import sky_logging
@@ -40,6 +40,27 @@ class SSHMessageType(IntEnum):
     REGULAR_DATA = 0
     PINGPONG = 1
     LATENCY_MEASUREMENT = 2
+    REDIRECT = 3
+
+
+# Hook for plugins to inject SSH redirect logic. When set, it is called after
+# WebSocket accept for clients that support the redirect protocol. The hook
+# receives (websocket, cluster_name) and returns redirect info dict or None.
+_ssh_redirect_hook: Optional[Callable] = None
+
+
+def register_ssh_redirect_hook(
+    hook: Callable[[fastapi.WebSocket, str], Awaitable[Optional[dict]]],
+) -> None:
+    """Register a hook that checks whether an SSH connection should redirect.
+
+    The hook is called with (websocket, cluster_name) after the WebSocket is
+    accepted but before the backend connection is established.  It should
+    return a dict with redirect info (e.g. ``{agent_url, token, ...}``) or
+    ``None`` to proceed normally.
+    """
+    global _ssh_redirect_hook
+    _ssh_redirect_hook = hook
 
 
 async def _get_cluster_and_validate(
@@ -62,27 +83,32 @@ async def _get_cluster_and_validate(
             core.status,
             cluster_name,
             all_users=True,
-            summary_response=True)
+            summary_response=True,
+        )
 
     if not cluster_records:
-        raise fastapi.HTTPException(status_code=404,
-                                    detail=f'Cluster {cluster_name} not found')
+        raise fastapi.HTTPException(
+            status_code=404, detail=f'Cluster {cluster_name} not found'
+        )
     cluster_record = cluster_records[0]
 
-    if cluster_record['status'] not in (status_lib.ClusterStatus.INIT,
-                                        status_lib.ClusterStatus.UP,
-                                        status_lib.ClusterStatus.AUTOSTOPPING):
+    if cluster_record['status'] not in (
+        status_lib.ClusterStatus.INIT,
+        status_lib.ClusterStatus.UP,
+        status_lib.ClusterStatus.AUTOSTOPPING,
+    ):
         raise fastapi.HTTPException(
-            status_code=400, detail=f'Cluster {cluster_name} is not running')
+            status_code=400, detail=f'Cluster {cluster_name} is not running'
+        )
 
-    handle: Optional['backends.CloudVmRayResourceHandle'] = cluster_record[
-        'handle']
+    handle: Optional[backends.CloudVmRayResourceHandle] = cluster_record['handle']
     assert handle is not None, 'Cluster handle is None'
     if not isinstance(handle.launched_resources.cloud, cloud_type):
         raise fastapi.HTTPException(
             status_code=400,
             detail=f'Cluster {cluster_name} is not a {str(cloud_type())} '
-            'cluster. Use ssh to connect to the cluster instead.')
+            'cluster. Use ssh to connect to the cluster instead.',
+        )
 
     return handle
 
@@ -123,7 +149,8 @@ async def _run_websocket_proxy(
                         ping_id_size = struct.calcsize('!I')
                         if len(message) != type_size + ping_id_size:
                             raise ValueError(
-                                f'Invalid PING message length: {len(message)}')
+                                f'Invalid PING message length: {len(message)}'
+                            )
                         # Return the same PING message for latency measurement
                         await websocket.send_bytes(message)
                         continue
@@ -131,18 +158,20 @@ async def _run_websocket_proxy(
                         # Latency measurement from client
                         latency_size = struct.calcsize('!Q')
                         if len(message) != type_size + latency_size:
-                            raise ValueError('Invalid latency measurement '
-                                             f'message length: {len(message)}')
+                            raise ValueError(
+                                'Invalid latency measurement '
+                                f'message length: {len(message)}'
+                            )
                         avg_latency_ms = struct.unpack(
-                            '!Q',
-                            message[type_size:type_size + latency_size])[0]
+                            '!Q', message[type_size : type_size + latency_size]
+                        )[0]
                         latency_seconds = avg_latency_ms / 1000
                         metrics_utils.SKY_APISERVER_WEBSOCKET_SSH_LATENCY_SECONDS.labels(  # pylint: disable=line-too-long
-                            pid=os.getpid()).observe(latency_seconds)
+                            pid=os.getpid()
+                        ).observe(latency_seconds)
                         continue
                     else:
-                        raise ValueError(
-                            f'Unknown message type: {message_type}')
+                        raise ValueError(f'Unknown message type: {message_type}')
 
                 try:
                     await write_to_backend(message)
@@ -150,8 +179,9 @@ async def _run_websocket_proxy(
                     # Typically we will not reach here, if the conn to backend
                     # is disconnected, backend_to_websocket will exit first.
                     # But just in case.
-                    logger.error(f'Failed to write to backend through '
-                                 f'connection: {e}')
+                    logger.error(
+                        f'Failed to write to backend through ' f'connection: {e}'
+                    )
                     nonlocal ssh_failed
                     ssh_failed = True
                     break
@@ -169,14 +199,16 @@ async def _run_websocket_proxy(
                     if not websocket_closed:
                         logger.warning(
                             'SSH connection to backend is disconnected '
-                            'before websocket connection is closed')
+                            'before websocket connection is closed'
+                        )
                         nonlocal ssh_failed
                         ssh_failed = True
                     break
                 if timestamps_supported:
                     # Prepend message type byte (0 = regular data)
                     message_type_bytes = struct.pack(
-                        '!B', SSHMessageType.REGULAR_DATA.value)
+                        '!B', SSHMessageType.REGULAR_DATA.value
+                    )
                     data = message_type_bytes + data
                 await websocket.send_bytes(data)
         except Exception:  # pylint: disable=broad-except
@@ -187,34 +219,60 @@ async def _run_websocket_proxy(
             # The websocket might have been closed by the client
             pass
 
-    await asyncio.gather(websocket_to_backend(),
-                         backend_to_websocket(),
-                         return_exceptions=True)
+    await asyncio.gather(
+        websocket_to_backend(), backend_to_websocket(), return_exceptions=True
+    )
 
     return ssh_failed
 
 
 @ssh_router.websocket('/kubernetes-pod-ssh-proxy')
 async def kubernetes_pod_ssh_proxy(
-        websocket: fastapi.WebSocket,
-        cluster_name: str,
-        client_version: Optional[int] = None) -> None:
+    websocket: fastapi.WebSocket,
+    cluster_name: str,
+    client_version: Optional[int] = None,
+) -> None:
     """Proxies SSH to the Kubernetes pod with websocket."""
     await websocket.accept()
     logger.info(f'WebSocket connection accepted for cluster: {cluster_name}')
 
     timestamps_supported = client_version is not None and client_version > 21
-    logger.info(f'Websocket timestamps supported: {timestamps_supported}, \
-        client_version = {client_version}')
+    logger.info(
+        f'Websocket timestamps supported: {timestamps_supported}, \
+        client_version = {client_version}'
+    )
+
+    # Check if the plugin hook wants to redirect this connection.
+    # Import here to avoid circular imports at module level.
+    from sky.server import constants as server_constants
+
+    if (
+        _ssh_redirect_hook is not None
+        and client_version is not None
+        and client_version >= server_constants.MIN_SSH_REDIRECT_PROTOCOL_VERSION
+    ):
+        try:
+            redirect_info = await _ssh_redirect_hook(websocket, cluster_name)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(f'SSH redirect hook failed for {cluster_name}: {e}')
+            redirect_info = None
+        if redirect_info is not None:
+            frame = (
+                struct.pack('!B', SSHMessageType.REDIRECT)
+                + json.dumps(redirect_info).encode()
+            )
+            await websocket.send_bytes(frame)
+            await websocket.close()
+            return
 
     handle = await _get_cluster_and_validate(cluster_name, clouds.Kubernetes)
 
     kubectl_cmd = handle.get_command_runners()[0].port_forward_command(
-        port_forward=[(None, 22)])
+        port_forward=[(None, 22)]
+    )
     proc = await asyncio.create_subprocess_exec(
-        *kubectl_cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT)
+        *kubectl_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
     logger.info(f'Started kubectl port-forward with command: {kubectl_cmd}')
 
     # Wait for port-forward to be ready and get the local port
@@ -235,7 +293,8 @@ async def kubernetes_pod_ssh_proxy(
 
     logger.info(f'Starting port-forward to local port: {local_port}')
     conn_gauge = metrics_utils.SKY_APISERVER_WEBSOCKET_CONNECTIONS.labels(
-        pid=os.getpid())
+        pid=os.getpid()
+    )
     ssh_failed = False
     try:
         conn_gauge.inc()
@@ -264,34 +323,41 @@ async def kubernetes_pod_ssh_proxy(
             proc.terminate()
         except ProcessLookupError:
             stdout = await proc.stdout.read()
-            logger.error('kubectl port-forward was terminated before the '
-                         'ssh websocket connection was closed. Remaining '
-                         f'output: {str(stdout)}')
+            logger.error(
+                'kubectl port-forward was terminated before the '
+                'ssh websocket connection was closed. Remaining '
+                f'output: {str(stdout)}'
+            )
             reason = 'KubectlPortForwardExit'
             metrics_utils.SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL.labels(
-                pid=os.getpid(), reason=reason).inc()
+                pid=os.getpid(), reason=reason
+            ).inc()
         else:
             if ssh_failed:
                 reason = 'SSHToPodDisconnected'
             else:
                 reason = 'ClientClosed'
         metrics_utils.SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL.labels(
-            pid=os.getpid(), reason=reason).inc()
+            pid=os.getpid(), reason=reason
+        ).inc()
 
 
 @ssh_router.websocket('/slurm-job-ssh-proxy')
-async def slurm_job_ssh_proxy(websocket: fastapi.WebSocket,
-                              cluster_name: str,
-                              worker: int = 0,
-                              client_version: Optional[int] = None) -> None:
+async def slurm_job_ssh_proxy(
+    websocket: fastapi.WebSocket,
+    cluster_name: str,
+    worker: int = 0,
+    client_version: Optional[int] = None,
+) -> None:
     """Proxies SSH to the Slurm job via sshd inside srun."""
     await websocket.accept()
-    logger.info(f'WebSocket connection accepted for cluster: '
-                f'{cluster_name}')
+    logger.info(f'WebSocket connection accepted for cluster: ' f'{cluster_name}')
 
     timestamps_supported = client_version is not None and client_version > 21
-    logger.info(f'Websocket timestamps supported: {timestamps_supported}, \
-        client_version = {client_version}')
+    logger.info(
+        f'Websocket timestamps supported: {timestamps_supported}, \
+        client_version = {client_version}'
+    )
 
     handle = await _get_cluster_and_validate(cluster_name, clouds.Slurm)
 
@@ -317,7 +383,8 @@ async def slurm_job_ssh_proxy(websocket: fastapi.WebSocket,
     ssh_cmd = login_node_runner.ssh_base_command(
         ssh_mode=command_runner.SshMode.NON_INTERACTIVE,
         port_forward=None,
-        connect_timeout=None)
+        connect_timeout=None,
+    )
 
     # There can only be one InstanceInfo per instance_id.
     head_instance = handle.cached_cluster_info.get_head_instance()
@@ -331,13 +398,13 @@ async def slurm_job_ssh_proxy(websocket: fastapi.WebSocket,
         raise fastapi.HTTPException(
             status_code=400,
             detail=f'Worker index {worker} out of range. '
-            f'Cluster has {len(node_hostnames)} nodes.')
+            f'Cluster has {len(node_hostnames)} nodes.',
+        )
     target_node = node_hostnames[worker]
 
     # Run sshd inside the Slurm job "container" via srun, such that it inherits
     # the resource constraints of the Slurm job.
-    is_container_image = handle.launched_resources.extract_docker_image(
-    ) is not None
+    is_container_image = handle.launched_resources.extract_docker_image() is not None
     ssh_cmd += [
         shlex.quote(
             slurm_utils.srun_sshd_command(
@@ -346,7 +413,8 @@ async def slurm_job_ssh_proxy(websocket: fastapi.WebSocket,
                 login_node_user,
                 handle.cluster_name_on_cloud,
                 is_container_image,
-            ))
+            )
+        )
     ]
 
     proc = await asyncio.create_subprocess_shell(
@@ -374,7 +442,8 @@ async def slurm_job_ssh_proxy(websocket: fastapi.WebSocket,
     if env_options.Options.SHOW_DEBUG_INFO.get():
         stderr_task = asyncio.create_task(log_stderr())
     conn_gauge = metrics_utils.SKY_APISERVER_WEBSOCKET_CONNECTIONS.labels(
-        pid=os.getpid())
+        pid=os.getpid()
+    )
     ssh_failed = False
     try:
         conn_gauge.inc()
@@ -402,12 +471,15 @@ async def slurm_job_ssh_proxy(websocket: fastapi.WebSocket,
             proc.terminate()
         except ProcessLookupError:
             stdout_data = await stdout.read()
-            logger.error('srun process was terminated before the '
-                         'ssh websocket connection was closed. Remaining '
-                         f'output: {str(stdout_data)}')
+            logger.error(
+                'srun process was terminated before the '
+                'ssh websocket connection was closed. Remaining '
+                f'output: {str(stdout_data)}'
+            )
             reason = 'SrunProcessExit'
             metrics_utils.SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL.labels(
-                pid=os.getpid(), reason=reason).inc()
+                pid=os.getpid(), reason=reason
+            ).inc()
         else:
             if ssh_failed:
                 reason = 'SSHToSlurmJobDisconnected'
@@ -415,7 +487,8 @@ async def slurm_job_ssh_proxy(websocket: fastapi.WebSocket,
                 reason = 'ClientClosed'
 
         metrics_utils.SKY_APISERVER_WEBSOCKET_CLOSED_TOTAL.labels(
-            pid=os.getpid(), reason=reason).inc()
+            pid=os.getpid(), reason=reason
+        ).inc()
 
         # Cancel the stderr logging task if it's still running
         if stderr_task is not None and not stderr_task.done():
@@ -427,8 +500,7 @@ async def slurm_job_ssh_proxy(websocket: fastapi.WebSocket,
 
 
 @ssh_router.websocket('/ssh-interactive-auth')
-async def ssh_interactive_auth(websocket: fastapi.WebSocket,
-                               session_id: str) -> None:
+async def ssh_interactive_auth(websocket: fastapi.WebSocket, session_id: str) -> None:
     """Proxies PTY for SSH interactive authentication via websocket.
 
     This endpoint receives a PTY file descriptor from a worker process
@@ -438,8 +510,7 @@ async def ssh_interactive_auth(websocket: fastapi.WebSocket,
     Detects auth completion by monitoring terminal echo state and data flow.
     """
     await websocket.accept()
-    logger.info(f'WebSocket connection accepted for SSH auth session: '
-                f'{session_id}')
+    logger.info(f'WebSocket connection accepted for SSH auth session: ' f'{session_id}')
 
     loop = asyncio.get_running_loop()
 
@@ -450,18 +521,15 @@ async def ssh_interactive_auth(websocket: fastapi.WebSocket,
     try:
         # Connect to worker's FD-passing socket
         await loop.sock_connect(fd_sock, fd_socket_path)
-        master_fd = await loop.run_in_executor(None, interactive_utils.recv_fd,
-                                               fd_sock)
-        logger.debug(f'Received PTY master fd {master_fd} for session '
-                     f'{session_id}')
+        master_fd = await loop.run_in_executor(None, interactive_utils.recv_fd, fd_sock)
+        logger.debug(f'Received PTY master fd {master_fd} for session ' f'{session_id}')
 
         # Bridge PTY ↔ websocket bidirectionally
         async def websocket_to_pty():
             """Forward websocket messages to PTY."""
             try:
                 async for message in websocket.iter_bytes():
-                    await loop.run_in_executor(None, os.write, master_fd,
-                                               message)
+                    await loop.run_in_executor(None, os.write, master_fd, message)
             except fastapi.WebSocketDisconnect:
                 logger.debug(f'WebSocket disconnected for session {session_id}')
             except asyncio.CancelledError:
@@ -481,7 +549,8 @@ async def ssh_interactive_auth(websocket: fastapi.WebSocket,
                 while True:
                     try:
                         data = await loop.run_in_executor(
-                            None, os.read, master_fd, 4096)
+                            None, os.read, master_fd, 4096
+                        )
                     except OSError as e:
                         logger.error(f'PTY read error (likely closed): {e}')
                         break

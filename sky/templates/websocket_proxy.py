@@ -8,7 +8,9 @@
 
 This script is useful for users who do not have local Kubernetes credentials.
 """
+
 import asyncio
+import json
 import os
 import struct
 import sys
@@ -16,16 +18,15 @@ import time
 from typing import Dict, Optional
 
 import requests
-import websockets
-from websockets.asyncio.client import ClientConnection
-from websockets.asyncio.client import connect
-
 from sky import exceptions
 from sky.client import service_account_auth
 from sky.server import common as server_common
 from sky.server import constants
 from sky.server.ssh_proxy import SSHMessageType
 from sky.skylet import constants as skylet_constants
+import websockets
+from websockets.asyncio.client import ClientConnection
+from websockets.asyncio.client import connect
 
 BUFFER_SIZE = 2**16  # 64KB
 HEARTBEAT_INTERVAL_SECONDS = 10
@@ -36,11 +37,13 @@ MAX_UNANSWERED_PINGS = 100
 OPEN_TIMEOUT_SECONDS = 60
 
 
-
-async def main(url: str,
-               timestamps_supported: bool,
-               login_url: str,
-               override_headers: Optional[Dict[str, str]] = None) -> None:
+async def main(
+    url: str,
+    timestamps_supported: bool,
+    login_url: str,
+    override_headers: Optional[Dict[str, str]] = None,
+    first_message: Optional[bytes] = None,
+) -> None:
     headers = {}
     if override_headers:
         headers.update(override_headers)
@@ -48,26 +51,33 @@ async def main(url: str,
         headers.update(server_common.get_cookie_header_for_url(url))
         headers.update(service_account_auth.get_service_account_headers())
     try:
-        async with connect(url,
-                           ping_interval=None,
-                           open_timeout=OPEN_TIMEOUT_SECONDS,
-                           additional_headers=headers) as websocket:
-            await run_websocket_proxy(websocket, timestamps_supported)
+        async with connect(
+            url,
+            ping_interval=None,
+            open_timeout=OPEN_TIMEOUT_SECONDS,
+            additional_headers=headers,
+        ) as websocket:
+            await run_websocket_proxy(websocket, timestamps_supported, first_message)
     except websockets.exceptions.InvalidStatus as e:
         if e.response.status_code == 403:
-            print(str(exceptions.ApiServerAuthenticationError(login_url)),
-                  file=sys.stderr)
+            print(
+                str(exceptions.ApiServerAuthenticationError(login_url)), file=sys.stderr
+            )
         else:
             print(f'Error ssh into cluster: {e}', file=sys.stderr)
         sys.exit(1)
 
 
-async def run_websocket_proxy(websocket: ClientConnection,
-                              timestamps_supported: bool) -> None:
+async def run_websocket_proxy(
+    websocket: ClientConnection,
+    timestamps_supported: bool,
+    first_message: Optional[bytes] = None,
+) -> None:
     if os.isatty(sys.stdin.fileno()):
         # pylint: disable=import-outside-toplevel
         import termios
         import tty
+
         old_settings = termios.tcgetattr(sys.stdin.fileno())
         tty.setraw(sys.stdin.fileno())
     else:
@@ -82,7 +92,8 @@ async def run_websocket_proxy(websocket: ClientConnection,
         protocol = asyncio.StreamReaderProtocol(stdin_reader)
         await loop.connect_read_pipe(lambda: protocol, sys.stdin)
         transport, protocol = await loop.connect_write_pipe(
-            asyncio.streams.FlowControlMixin, sys.stdout)  # type: ignore
+            asyncio.streams.FlowControlMixin, sys.stdout
+        )  # type: ignore
         stdout_writer = asyncio.StreamWriter(transport, protocol, None, loop)
         # Dictionary to store last ping time for latency measurement
         last_ping_time_dict: Optional[Dict[int, float]] = None
@@ -94,24 +105,38 @@ async def run_websocket_proxy(websocket: ClientConnection,
         websocket_lock = asyncio.Lock()
 
         await asyncio.gather(
-            stdin_to_websocket(stdin_reader, websocket, timestamps_supported,
-                               websocket_closed_event, websocket_lock),
-            websocket_to_stdout(websocket, stdout_writer, timestamps_supported,
-                                last_ping_time_dict, websocket_closed_event,
-                                websocket_lock),
-            latency_monitor(websocket, last_ping_time_dict,
-                            websocket_closed_event, websocket_lock),
-            return_exceptions=True)
+            stdin_to_websocket(
+                stdin_reader,
+                websocket,
+                timestamps_supported,
+                websocket_closed_event,
+                websocket_lock,
+            ),
+            websocket_to_stdout(
+                websocket,
+                stdout_writer,
+                timestamps_supported,
+                last_ping_time_dict,
+                websocket_closed_event,
+                websocket_lock,
+                first_message,
+            ),
+            latency_monitor(
+                websocket, last_ping_time_dict, websocket_closed_event, websocket_lock
+            ),
+            return_exceptions=True,
+        )
     finally:
         if old_settings:
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN,
-                              old_settings)
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
 
 
-async def latency_monitor(websocket: ClientConnection,
-                          last_ping_time_dict: Optional[dict],
-                          websocket_closed_event: asyncio.Event,
-                          websocket_lock: asyncio.Lock):
+async def latency_monitor(
+    websocket: ClientConnection,
+    last_ping_time_dict: Optional[dict],
+    websocket_closed_event: asyncio.Event,
+    websocket_lock: asyncio.Lock,
+):
     """Periodically send PING messages (type 1) to measure latency."""
     if last_ping_time_dict is None:
         return
@@ -126,9 +151,9 @@ async def latency_monitor(websocket: ClientConnection,
             ping_time = time.time()
             next_id += 1
             last_ping_time_dict[next_id] = ping_time
-            message_header_bytes = struct.pack('!BI',
-                                               SSHMessageType.PINGPONG.value,
-                                               next_id)
+            message_header_bytes = struct.pack(
+                '!BI', SSHMessageType.PINGPONG.value, next_id
+            )
             try:
                 async with websocket_lock:
                     await websocket.send(message_header_bytes)
@@ -142,11 +167,13 @@ async def latency_monitor(websocket: ClientConnection,
             raise e
 
 
-async def stdin_to_websocket(reader: asyncio.StreamReader,
-                             websocket: ClientConnection,
-                             timestamps_supported: bool,
-                             websocket_closed_event: asyncio.Event,
-                             websocket_lock: asyncio.Lock):
+async def stdin_to_websocket(
+    reader: asyncio.StreamReader,
+    websocket: ClientConnection,
+    timestamps_supported: bool,
+    websocket_closed_event: asyncio.Event,
+    websocket_lock: asyncio.Lock,
+):
     try:
         while not websocket_closed_event.is_set():
             # Read at most BUFFER_SIZE bytes, this not affect
@@ -161,7 +188,8 @@ async def stdin_to_websocket(reader: asyncio.StreamReader,
             if timestamps_supported:
                 # Send message with type 0 to indicate data.
                 message_type_bytes = struct.pack(
-                    '!B', SSHMessageType.REGULAR_DATA.value)
+                    '!B', SSHMessageType.REGULAR_DATA.value
+                )
                 data = message_type_bytes + data
             async with websocket_lock:
                 await websocket.send(data)
@@ -174,17 +202,30 @@ async def stdin_to_websocket(reader: asyncio.StreamReader,
         websocket_closed_event.set()
 
 
-async def websocket_to_stdout(websocket: ClientConnection,
-                              writer: asyncio.StreamWriter,
-                              timestamps_supported: bool,
-                              last_ping_time_dict: Optional[dict],
-                              websocket_closed_event: asyncio.Event,
-                              websocket_lock: asyncio.Lock):
+async def websocket_to_stdout(
+    websocket: ClientConnection,
+    writer: asyncio.StreamWriter,
+    timestamps_supported: bool,
+    last_ping_time_dict: Optional[dict],
+    websocket_closed_event: asyncio.Event,
+    websocket_lock: asyncio.Lock,
+    first_message: Optional[bytes] = None,
+):
     try:
+        # If we already received a first message (e.g. from redirect check),
+        # process it before entering the recv loop.
+        pending_message = first_message
         while not websocket_closed_event.is_set():
-            message = await websocket.recv()
-            if (timestamps_supported and len(message) > 0 and
-                    last_ping_time_dict is not None):
+            if pending_message is not None:
+                message = pending_message
+                pending_message = None
+            else:
+                message = await websocket.recv()
+            if (
+                timestamps_supported
+                and len(message) > 0
+                and last_ping_time_dict is not None
+            ):
                 message_type = struct.unpack('!B', message[:1])[0]
                 if message_type == SSHMessageType.REGULAR_DATA.value:
                     # Regular data - strip type byte and write to stdout
@@ -192,8 +233,7 @@ async def websocket_to_stdout(websocket: ClientConnection,
                 elif message_type == SSHMessageType.PINGPONG.value:
                     # PONG response - calculate latency and send measurement
                     if not len(message) == struct.calcsize('!BI'):
-                        raise ValueError(
-                            f'Invalid PONG message length: {len(message)}')
+                        raise ValueError(f'Invalid PONG message length: {len(message)}')
                     pong_id = struct.unpack('!I', message[1:5])[0]
                     pong_time = time.time()
 
@@ -207,7 +247,8 @@ async def websocket_to_stdout(websocket: ClientConnection,
 
                     # Send latency measurement (type 2)
                     message_type_bytes = struct.pack(
-                        '!B', SSHMessageType.LATENCY_MEASUREMENT.value)
+                        '!B', SSHMessageType.LATENCY_MEASUREMENT.value
+                    )
                     latency_bytes = struct.pack('!Q', latency_ms)
                     message = message_type_bytes + latency_bytes
                     # Send to server.
@@ -228,11 +269,106 @@ async def websocket_to_stdout(websocket: ClientConnection,
         websocket_closed_event.set()
 
 
+async def _connect_with_redirect(
+    websocket_url: str,
+    timestamps_supported: bool,
+    login_url: str,
+    cluster_name: str,
+    endpoint: str,
+    worker_idx: str,
+    client_version_str: str,
+) -> None:
+    """Connect to WebSocket, handle REDIRECT frame if server sends one."""
+    headers: Dict[str, str] = {}
+    headers.update(server_common.get_cookie_header_for_url(websocket_url))
+    headers.update(service_account_auth.get_service_account_headers())
+    try:
+        async with connect(
+            websocket_url,
+            ping_interval=None,
+            open_timeout=OPEN_TIMEOUT_SECONDS,
+            additional_headers=headers,
+        ) as websocket:
+            if timestamps_supported:
+                # Read the first frame to check for REDIRECT.
+                first_msg = await websocket.recv()
+                if (
+                    len(first_msg) > 0
+                    and struct.unpack('!B', first_msg[:1])[0] == SSHMessageType.REDIRECT
+                ):
+                    # Server wants us to connect to an agent instead.
+                    redirect_info = json.loads(first_msg[1:].decode())
+                    # Close this connection; reconnect to the agent below.
+                    await websocket.close()
+                    await _connect_to_agent(
+                        redirect_info,
+                        timestamps_supported,
+                        login_url,
+                        cluster_name,
+                        endpoint,
+                        worker_idx,
+                        client_version_str,
+                    )
+                    return
+                # Not a redirect — proceed with normal proxy, passing the
+                # already-consumed first message.
+                await run_websocket_proxy(
+                    websocket, timestamps_supported, first_message=first_msg
+                )
+            else:
+                await run_websocket_proxy(websocket, timestamps_supported)
+    except websockets.exceptions.InvalidStatus as e:
+        if e.response.status_code == 403:
+            print(
+                str(exceptions.ApiServerAuthenticationError(login_url)), file=sys.stderr
+            )
+        else:
+            print(f'Error ssh into cluster: {e}', file=sys.stderr)
+        sys.exit(1)
+
+
+async def _connect_to_agent(
+    redirect_info: dict,
+    timestamps_supported: bool,
+    login_url: str,
+    cluster_name: str,
+    endpoint: str,
+    worker_idx: str,
+    client_version_str: str,
+) -> None:
+    """Reconnect to an agent after receiving a REDIRECT frame."""
+    agent_url = redirect_info['agent_url']
+    agent_token = redirect_info['token']
+    if '://' not in agent_url:
+        agent_url = f'http://{agent_url}'
+
+    agent_proto, agent_fqdn = agent_url.split('://')
+    ws_proto = 'wss' if agent_proto == 'https' else 'ws'
+    pod_name = redirect_info.get('pod_name', '')
+    namespace = redirect_info.get('namespace', '')
+    agent_ws_url = (
+        f'{ws_proto}://{agent_fqdn}/{endpoint}'
+        f'?cluster_name={cluster_name}'
+        f'&worker={worker_idx}'
+        f'&pod_name={pod_name}'
+        f'&namespace={namespace}'
+        f'{client_version_str}'
+    )
+    await main(
+        agent_ws_url,
+        timestamps_supported,
+        login_url,
+        override_headers={'Authorization': f'Bearer {agent_token}'},
+    )
+
+
 if __name__ == '__main__':
     server_url = sys.argv[1].strip('/')
 
-    disable_latency_measurement = os.environ.get(
-        skylet_constants.SSH_DISABLE_LATENCY_MEASUREMENT_ENV_VAR, '0') == '1'
+    disable_latency_measurement = (
+        os.environ.get(skylet_constants.SSH_DISABLE_LATENCY_MEASUREMENT_ENV_VAR, '0')
+        == '1'
+    )
     if disable_latency_measurement:
         timestamps_are_supported = False
     else:
@@ -253,8 +389,9 @@ if __name__ == '__main__':
         websocket_proto = 'wss'
     server_url = f'{websocket_proto}://{server_fqdn}'
 
-    client_version_str = (f'&client_version={constants.API_VERSION}'
-                          if timestamps_are_supported else '')
+    client_version_str = (
+        f'&client_version={constants.API_VERSION}' if timestamps_are_supported else ''
+    )
 
     # For backwards compatibility, fallback to kubernetes-pod-ssh-proxy if
     # no endpoint is provided.
@@ -262,50 +399,56 @@ if __name__ == '__main__':
     # Worker index for Slurm.
     worker_idx = sys.argv[4] if len(sys.argv) > 4 else '0'
     cluster_name = sys.argv[2]
-    websocket_url = (f'{server_url}/{endpoint}'
-                     f'?cluster_name={cluster_name}'
-                     f'&worker={worker_idx}'
-                     f'{client_version_str}')
+    websocket_url = (
+        f'{server_url}/{endpoint}'
+        f'?cluster_name={cluster_name}'
+        f'&worker={worker_idx}'
+        f'{client_version_str}'
+    )
 
-    # Pre-flight redirect check: ask server if SSH should go through an agent
-    proxy_info_url = (f'{_login_url}/ssh-proxy-info'
-                      f'?cluster_name={cluster_name}&endpoint={endpoint}')
-    try:
-        cookie_hdr = server_common.get_cookie_header_for_url(proxy_info_url)
-        sa_hdr = service_account_auth.get_service_account_headers()
-        all_headers = {**cookie_hdr, **sa_hdr}
-        proxy_info = requests.get(proxy_info_url,
-                                  headers=all_headers,
-                                  timeout=5).json()
-    except Exception:  # pylint: disable=broad-except
-        proxy_info = {'redirect': False}
-
-    if proxy_info.get('redirect'):
-        # Redirect: connect to agent instead of API server
-        agent_url = proxy_info['agent_url']
-        agent_token = proxy_info['token']
-        # Ensure agent_url has a scheme for reliable parsing
-        if '://' not in agent_url:
-            agent_url = f'http://{agent_url}'
-
-        agent_proto, agent_fqdn = agent_url.split('://')
-        ws_proto = 'wss' if agent_proto == 'https' else 'ws'
-        # Pass pod_name and namespace so the agent can port-forward
-        # directly without looking up the cluster in its database.
-        pod_name = proxy_info.get('pod_name', '')
-        namespace = proxy_info.get('namespace', '')
-        agent_ws_url = (f'{ws_proto}://{agent_fqdn}/{endpoint}'
-                        f'?cluster_name={cluster_name}'
-                        f'&worker={worker_idx}'
-                        f'&pod_name={pod_name}'
-                        f'&namespace={namespace}'
-                        f'{client_version_str}')
+    # Try the in-band redirect protocol first (new servers send a REDIRECT
+    # frame as the first WebSocket message). Fall back to the legacy
+    # /ssh-proxy-info pre-flight HTTP GET for old servers that don't support
+    # the first-frame protocol.
+    if timestamps_are_supported:
         asyncio.run(
-            main(agent_ws_url,
-                 timestamps_are_supported,
-                 _login_url,
-                 override_headers={'Authorization':
-                                   f'Bearer {agent_token}'}))
+            _connect_with_redirect(
+                websocket_url,
+                timestamps_are_supported,
+                _login_url,
+                cluster_name,
+                endpoint,
+                worker_idx,
+                client_version_str,
+            )
+        )
     else:
-        asyncio.run(
-            main(websocket_url, timestamps_are_supported, _login_url))
+        # Old server: use legacy pre-flight redirect check.
+        proxy_info_url = (
+            f'{_login_url}/ssh-proxy-info'
+            f'?cluster_name={cluster_name}&endpoint={endpoint}'
+        )
+        try:
+            cookie_hdr = server_common.get_cookie_header_for_url(proxy_info_url)
+            sa_hdr = service_account_auth.get_service_account_headers()
+            all_headers = {**cookie_hdr, **sa_hdr}
+            proxy_info = requests.get(
+                proxy_info_url, headers=all_headers, timeout=5
+            ).json()
+        except Exception:  # pylint: disable=broad-except
+            proxy_info = {'redirect': False}
+
+        if proxy_info.get('redirect'):
+            asyncio.run(
+                _connect_to_agent(
+                    proxy_info,
+                    timestamps_are_supported,
+                    _login_url,
+                    cluster_name,
+                    endpoint,
+                    worker_idx,
+                    client_version_str,
+                )
+            )
+        else:
+            asyncio.run(main(websocket_url, timestamps_are_supported, _login_url))
