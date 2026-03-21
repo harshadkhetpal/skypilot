@@ -1313,8 +1313,14 @@ class Resources:
         # Validate the job recovery strategy
         assert isinstance(self._job_recovery['strategy'],
                           str), 'Job recovery strategy must be a string'
-        registry.JOBS_RECOVERY_STRATEGY_REGISTRY.from_str(
-            self._job_recovery['strategy'])
+        try:
+            registry.JOBS_RECOVERY_STRATEGY_REGISTRY.from_str(
+                self._job_recovery['strategy'])
+        except ValueError:
+            # Strategy may be registered by a server-side plugin that
+            # is not loaded on the client. Defer validation to the
+            # server.
+            pass
 
     def extract_docker_image(self) -> Optional[str]:
         if self.image_id is None:

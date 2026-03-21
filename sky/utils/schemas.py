@@ -10,6 +10,27 @@ from sky.skylet import autostop_lib
 from sky.skylet import constants
 from sky.utils import kubernetes_enums
 
+# Registry for plugin-provided job_recovery schema properties.
+# Plugins call register_job_recovery_property() to add strategy-specific
+# config fields while keeping additionalProperties: False.
+_extra_job_recovery_properties: Dict[str, Any] = {}
+
+
+def register_job_recovery_property(name: str, schema: Dict[str, Any]) -> None:
+    """Register an additional property for the job_recovery schema.
+
+    This allows plugins to extend the job_recovery dict schema with
+    strategy-specific configuration fields. The property is merged into
+    the schema's properties dict, so it passes JSON schema validation
+    even with additionalProperties: False.
+
+    Args:
+        name: The property name.
+        schema: The JSON Schema for the property
+            (e.g., {'type': 'integer'}).
+    """
+    _extra_job_recovery_properties[name] = schema
+
 
 def _check_not_both_fields_present(field1: str, field2: str):
     return {
@@ -255,6 +276,9 @@ def _get_single_resources_schema():
                                     },
                                 ],
                             },
+                            # Plugin-registered strategy-specific
+                            # properties.
+                            **_extra_job_recovery_properties,
                         }
                     }
                 ],
